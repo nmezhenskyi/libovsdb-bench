@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -21,43 +20,12 @@ import (
 type NB struct {
 	client client.Client
 	cookie client.MonitorCookie
-
-	sbCond    *sync.Cond
-	sbCurrent int
 }
-
-type nbGlobalHandler struct {
-	nb *NB
-}
-
-func (h *nbGlobalHandler) OnAdd(table string, newModel model.Model) {
-	h.OnUpdate(table, nil, newModel)
-}
-
-func (h *nbGlobalHandler) OnUpdate(table string, oldModel, newModel model.Model) {
-	if table != "NB_Global" {
-		return
-	}
-
-	nbGlobal, ok := newModel.(*NBGlobal)
-	if !ok {
-		return
-	}
-
-	h.nb.sbCond.L.Lock()
-	h.nb.sbCurrent = nbGlobal.SbCfg
-	h.nb.sbCond.Broadcast()
-	h.nb.sbCond.L.Unlock()
-}
-
-func (h *nbGlobalHandler) OnDelete(table string, m model.Model) {}
 
 // NewNB initialises new OVN client for Northbound operations.
 func NewNB(dbAddr string) (*NB, error) {
 	// Create the client struct.
-	c := &NB{
-		sbCond: sync.NewCond(&sync.Mutex{}),
-	}
+	c := &NB{}
 
 	// Prepare the OVSDB client.
 	dbSchema, err := FullDatabaseModel()
@@ -96,8 +64,6 @@ func NewNB(dbAddr string) (*NB, error) {
 		return nil, fmt.Errorf("Failed to send echo to OVN Northbound database: %w", err)
 	}
 
-	ovn.Cache().AddEventHandler(&nbGlobalHandler{nb: c})
-
 	monitorCookie, err := ovn.MonitorAll(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("Failed to set up libovsdb monitor: %w", err)
@@ -106,16 +72,6 @@ func NewNB(dbAddr string) (*NB, error) {
 	// Set the fields needed for the libovsdb client.
 	c.client = ovn
 	c.cookie = monitorCookie
-
-	// Populate initial state.
-	// We must populate sbCurrent immediately after monitoring,
-	// otherwise the first waitForSB call might block if no update happens soon.
-	var list []NBGlobal
-	if err := ovn.List(context.Background(), &list); err == nil && len(list) > 0 {
-		c.sbCond.L.Lock()
-		c.sbCurrent = list[0].SbCfg
-		c.sbCond.L.Unlock()
-	}
 
 	// Set finalizer to stop the monitor.
 	runtime.SetFinalizer(c, func(o *NB) {
@@ -295,57 +251,25 @@ func (o *NB) transactAndWaitSB(ctx context.Context, operations ...ovsdb.Operatio
 // waitForSB implements a polling logic to wait until the configuration changes have
 // been applied in the Southbound database according to `targetCfg` value or the context expired.
 func (o *NB) waitForSB(ctx context.Context, targetCfg int) error {
-	o.sbCond.L.Lock()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 
-	// Fast path: already synced.
-	if o.sbCurrent >= targetCfg {
-		o.sbCond.L.Unlock() // Unlock before returning.
-		return nil
-	}
+	for {
+		select {
+		case <-ctx.Done():
+			return errors.New("Timeout waiting for OVN to sync")
+		case <-ticker.C:
+			var list []NBGlobal
 
-	// Wait path:
-	done := make(chan struct{})
-
-	go func() {
-		o.sbCond.L.Lock()
-		defer o.sbCond.L.Unlock()
-
-		// Loop until condition met OR context dead
-		for o.sbCurrent < targetCfg {
-			// Check context before waiting.
-			// If the parent cancelled, we must exit to avoid leaking.
-			if ctx.Err() != nil {
-				return
+			// This read is done from in-memory cache, so it is fast.
+			err := o.client.List(ctx, &list)
+			if err != nil {
+				continue
 			}
 
-			o.sbCond.Wait()
-
-			// Check context immediately after waking.
-			// We might have been woken up specifically because of a timeout.
-			if ctx.Err() != nil {
-				return
+			if len(list) > 0 && list[0].SbCfg >= targetCfg {
+				return nil
 			}
 		}
-
-		close(done)
-	}()
-
-	o.sbCond.L.Unlock()
-
-	select {
-	case <-done:
-		return nil
-
-	case <-ctx.Done():
-		// We hit the timeout. The goroutine above is likely asleep in Wait().
-		// We MUST wake it up so it can hit the 'if ctx.Err()' check and exit.
-
-		// Note: Broadcast() is allowed without a lock, but grabbing it ensures
-		// we don't race with the child entering the Wait() state.
-		o.sbCond.L.Lock()
-		o.sbCond.Broadcast()
-		o.sbCond.L.Unlock()
-
-		return errors.New("Timeout waiting for OVN to sync")
 	}
 }
